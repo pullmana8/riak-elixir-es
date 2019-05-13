@@ -1,0 +1,437 @@
+= Riak in Docker
+Jon Brisbin <jbrisbin@basho.com>
+
+This asciibuild footnote:[https://github.com/jbrisbin/asciibuild] file can be used to build a wide variety of variations of Docker containers for running a Riak cluster. It runs a single node per container instance and by setting the `CLUSTER_COORDINATOR` environment variable to the IP address of a "master" node (the primary or seed node of a cluster), subsequent containers can be automatically joined into a cluster.
+
+image:https://travis-ci.org/basho-labs/riak-docker.svg[link="https://travis-ci.org/basho-labs/riak-docker"]
+
+include::vars.adoc[]
+
+.Variables to Set that influence the build
+* `riak_version`: {riak_version}
+* `riak_flavor`: {riak_flavor}
+* `riak_tag`: {riak_tag}
+* `riak_explorer_version`: {riak_explorer_version}
+* `riak_client_version`: {riak_client_version}
+
+[[switches]]
+.Variables for turning on or off components
+* `openjdk`: _set or unset_ Whether or not to include OpenJDK 8
+* `docker`: _set or unset_ Whether or not to include the Docker command-line tools
+* `riak_explorer`: _set or unset_ Whether or not to include Riak Explorer
+* `riak_client`: _set or unset_ Whether or not to include the Riak Python client
+
+== Create Image
+
+.Riak Docker
+[source,Dockerfile]
+[asciibuild,Dockerfile,image="{riak_tag}",run=true,run_opts="--label role=cluster --name {riak_pkg} -p 8087:8087 -p 8098:8098 -v /var/run/docker.sock:/var/run/docker.sock"]
+----
+FROM {{os_family}}:{{os_version}}
+
+ENV OS_FAMILY {{os_family}}
+ENV OS_VERSION {{os_version}}
+ifdef::os_flavor[]
+ENV OS_FLAVOR {{os_flavor}}
+endif::[]
+
+ifdef::ubuntu,debian[]
+ENV DEBIAN_FRONTEND noninteractive
+ENV DEBCONF_NONINTERACTIVE_SEEN true
+
+# Install essentials
+RUN apt-get update
+RUN apt-get dist-upgrade -y
+RUN apt-get install -y apt-transport-https
+RUN apt-get install -y python python-six python-pkg-resources python-openssl
+RUN apt-get install -y curl
+RUN apt-get install -y libapr1 realpath jq unzip
+RUN apt-get install -y iproute iputils-ping
+
+ifdef::openjdk[]
+# Install OpenJDK 8
+RUN apt-key adv --keyserver keyserver.ubuntu.com --recv-keys DA1A4A13543B466853BAF164EB9B1D8886F44E2A
+ifdef::ubuntu[]
+RUN echo "deb http://ppa.launchpad.net/openjdk-r/ppa/ubuntu {{os_flavor}} main" >/etc/apt/sources.list.d/openjdk.list
+RUN echo "deb-src http://ppa.launchpad.net/openjdk-r/ppa/ubuntu {{os_flavor}} main" >>/etc/apt/sources.list.d/openjdk.list
+endif::ubuntu[]
+ifdef::debian+jessie[]
+RUN echo "deb http://http.debian.net/debian jessie-backports main" >/etc/apt/sources.list.d/openjdk.list
+endif::debian+jessie[]
+RUN apt-get update
+RUN apt-get install -y openjdk-8-jre-headless openjdk-8-jdk-headless
+endif::openjdk[]
+endif::ubuntu,debian[]
+
+ifdef::centos[]
+# Install essentials
+RUN yum install -y epel-release
+RUN yum -q -y install openssl curl python python-six python-setuptools ca-certificates jq which unzip
+ifdef::openjdk[]
+RUN yum -q -y install java-1.8.0-openjdk
+endif::openjdk[]
+endif::centos[]
+
+ifdef::docker[]
+# Install Docker for command-line utilities
+ifdef::ubuntu,debian[]
+RUN apt-get install -y docker
+endif::[]
+ifdef::centos[]
+RUN yum install -y docker
+endif::[]
+endif::docker[]
+
+ENV RIAK_VERSION {{riak_version}}
+ENV RIAK_HOME {{riak_home}}
+ifndef::riak_ts[]
+ENV RIAK_FLAVOR KV
+endif::[]
+ifdef::riak_ts[]
+ENV RIAK_FLAVOR TS
+endif::[]
+ifeval::["{pkg_format}" == "tgz"]
+RUN \
+  mkdir -p $RIAK_HOME && \
+  curl -sL {{riak_tgz_baseurl}}/{{os_family}}-{{os_version}}/{{riak_pkg}}-oss/{{riak_pkg}}-{{riak_version}}/{{riak_pkg}}-{{riak_version}}-bin.tgz | tar -zxf - -C $RIAK_HOME
+COPY rel_to_pkg.sh /tmp
+RUN chmod a+x /tmp/rel_to_pkg.sh && /tmp/rel_to_pkg.sh
+ENV PATH $RIAK_HOME/bin:$PATH
+endif::[]
+ifeval::["{pkg_format}" != "tgz"]
+RUN curl -s https://packagecloud.io/install/repositories/basho/{{riak_pkg}}/script.{{pkg_format}}.sh | bash
+ifdef::ubuntu,debian[]
+RUN apt-get install -y {{riak_pkg}}={{riak_version}}-1
+endif::[]
+ifdef::centos[]
+RUN yum install -y {{riak_pkg}}-{{riak_version}}
+endif::[]
+endif::[]
+
+ifdef::riak_explorer[]
+# Install Riak Explorer
+RUN curl -sSL https://github.com/basho-labs/riak_explorer/releases/download/{{riak_explorer_version}}/riak_explorer-{{riak_explorer_version}}.patch-{{os_family}}-{{os_version}}.tar.gz | tar -zxf - -C $RIAK_HOME --strip-components 2
+RUN for f in riak_pb riak_kv riak_ts riak_dt riak_search riak_yokozuna;do rm -f $RIAK_HOME/lib/basho-patches/$f*; done
+endif::riak_explorer[]
+
+ifdef::riak_client[]
+# Install the Python client
+ifdef::ubuntu,debian[]
+RUN apt-get install -y build-essential libssl-dev libffi-dev python-dev python-pip
+endif::[]
+ifdef::centos[]
+RUN yum groups install -y 'Development Tools'
+RUN yum install -y openssl-devel python-devel libffi-devel python-pip
+endif::[]
+RUN pip install --upgrade pip cryptography pyparsing appdirs riak
+endif::riak_client[]
+
+# Expose default ports
+EXPOSE 8087
+EXPOSE 8098
+
+# Expose volumes for data and logs
+VOLUME /var/log/riak
+VOLUME /var/lib/riak
+
+# Install custom start script
+COPY riak-cluster.sh $RIAK_HOME/riak-cluster.sh
+RUN chmod a+x $RIAK_HOME/riak-cluster.sh
+# Install custom hooks
+COPY prestart.d /etc/riak/prestart.d
+COPY poststart.d /etc/riak/poststart.d
+
+# Prepare for bootstrapping schemas
+RUN mkdir -p /etc/riak/schemas
+
+WORKDIR /var/lib/riak
+
+CMD ["{{riak_home}}/riak-cluster.sh"]
+
+# Clean up APT cache
+RUN rm -rf /var/lib/apt/lists/* /tmp/*
+----
+
+=== Building the Image
+
+This file is an asciibuild-enabled AsciiDoc file. It is also heavily parameterized in order to produce a wide variety of variations. Some of the variations possible include:
+
+.Docker Image Variations
+* Riak KV
+  - Based on `ubuntu:14.04`
+  - Based on `centos:7`
+* Riak TS
+  - Based on `ubuntu:14.04`
+  - Based on `centos:7`
+  - Based on `debian:8`
+* Optional components (enabled or disabled link:#switches[based on the attributes set])
+  - http://openjdk.java.net/[OpenJDK 8]
+  - https://github.com/basho-labs/riak_explorer[Riak Explorer]
+  - https://www.docker.com/[Docker]
+  - https://github.com/basho/riak-python-client[Riak Python client]
+
+This asciibuild file will produce a riak_{riak_flavor} image based on {os_family}:{os_version}. Optional components included in this build:
+
+.Optional Components
+ifdef::openjdk[]
+* OpenJDK 8
+endif::[]
+ifdef::docker[]
+* Docker
+endif::[]
+ifdef::riak_explorer[]
+* Riak Explorer
+endif::[]
+ifdef::riak_client[]
+* Riak Python Client
+endif::[]
+
+To build the image using `asciibuild`, process this README file:
+
+.Invoke Asciibuild
+[source,bash]
+----
+asciibuild README.adoc
+----
+
+To change the variation of image produced, set attributes according to the following configuration matrix:
+
+.Alternative Configuration
+|===
+| *Attribute Value* | *Produces*
+| `-a os_family=ubuntu -a os_version=14.04` | Ubuntu Trusty image
+| `-a os_family=centos -a os_version=7` | CentOS 7 image
+| `-a openjdk!` | Turns off OpenJDK install
+| `-a docker!` | Turns off Docker install
+| `-a riak_explorer!` | Turns off Riak Explorer install
+| `-a riak_client!` | Turns off Riak Python Client install
+|===
+
+== Test Single Node
+
+Validate the container is started by waiting for it to fully boot, then access the `/stats` endpoint.
+
+.Wait for riak_kv to start
+[source,bash]
+[asciibuild,bash,container="Riak Docker"]
+----
+riak-admin wait-for-service riak_kv
+----
+
+.Check node Status
+[source,bash]
+[asciibuild,bash]
+----
+function stats() {
+  echo `curl -s localhost:8098/stats | jq -r '.vnode_gets'`
+}
+# There should be no read stats for an empty cluster
+[ "0" == "$(stats)" ]
+# Increment the read stats
+curl -s localhost:8098/types/default/buckets/notfound/keys/notfound
+# Wait for stats to be eventually-consistent
+sleep 1
+# Verify read stats have incremented
+[ "3" == "$(stats)" ]
+----
+
+== Test User Conf
+
+To augment the `riak.conf` file with additional settings, mount a `user.conf` file into the `/etc/riak/` directory. Each line should follow the pattern `setting = value`. Each line will be split on the `=` and made into a regex passed to `sed` that matches the setting key and replaces the value with the value you specify in `user.conf`.
+
+.Patch Configuration File
+[source,bash]
+[asciibuild,bash]
+----
+# {{=<% %>=}}
+CONTAINER=$(docker run --label role=cluster -d -P -v `pwd`/test/user.conf:/etc/riak/user.conf <% riak_tag %>)
+docker exec $CONTAINER riak-admin wait-for-service riak_kv
+
+# Check that the backend was set to leveldb
+BACKEND=$(docker exec $CONTAINER riak config effective | egrep "^storage_backend" | cut -d= -f2 | tr -d ' ')
+[ "$BACKEND" == "leveldb" ]
+----
+
+== Test Cluster
+
+This Docker image has support for automatically creating a cluster by setting the environment variable `COORDINATOR_NODE` to the IP address of a node to which you want to join when the container starts.
+
+.Start additional Cluster Nodes
+[source,bash]
+[asciibuild,bash]
+----
+# {{=<% %>=}}
+# Discover coordinator node IP
+COORDINATOR_NODE=$(docker inspect -f {{.NetworkSettings.IPAddress}} <% riak_pkg %>)
+
+# Start new nodes for the cluster
+for i in 1 2; do
+  CONTAINER=$(docker run -d --label=asciibuild.name="Riak in Docker" --label=role=cluster -e COORDINATOR_NODE=$COORDINATOR_NODE <% riak_tag %>)
+  # Wait for node to completely start
+  docker exec $CONTAINER riak-admin wait-for-service riak_kv
+done
+
+# Wait for cluster to settle some
+sleep 5
+
+# Verify three nodes report up
+STATUS=$(docker exec <% riak_pkg %> riak-admin cluster status --format csv | tail -n 3 | cut -d, -f3)
+[ "$(echo $STATUS)" == "up up up" ]
+----
+
+ifdef::riak_explorer[]
+== Test Bucket Type Bootstrapping
+
+This Docker image has support for automatically boostrapping bucket types and TS tables. Files in `/etc/riak/schemas/` that end in `.dt` will be read and the name of the file (minus the extension `.dt`) will be used as the bucket name and the contents of the file should contain a single line, which is the bucket type to use.
+
+./etc/riak/schemas/my_bucket.dt
+----
+counter
+----
+
+If the boostrapping script found the above, it would translate that into a `riak-admin bucket-type create`, followed by a `riak-admin bucket-type activate`.
+
+.Datatype Bootstrapping
+[source,bash]
+----
+riak-admin bucket-type create my_bucket '{"props":{"datatype":"counter"}}'
+riak-admin bucket-type activate my_bucket
+----
+
+To enable automatic bootstrapping, mount the schemas into the container via volume, or `COPY` the resources into the `/etc/riak/schemas` directory in a derived container.
+
+.Mount via Volume
+[source,bash]
+[asciibuild,bash]
+----
+# {{=<% %>=}}
+SCHEMAS_CONTAINER=$(docker run -d -P --label role=schemas -v $(pwd)/test/schemas:/etc/riak/schemas <% riak_tag %>)
+docker exec $SCHEMAS_CONTAINER riak-admin wait-for-service riak_kv
+
+# Discover the IP of the container
+IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' $SCHEMAS_CONTAINER)
+
+# Only way to ensure bucket types exist is to wait for script to complete.
+# There's no way to know when it's done, so we just do a sleep.
+sleep 5
+
+# Check that the bucket type has been defined
+BUCKET_TYPES=$(docker exec $SCHEMAS_CONTAINER curl -s $IP:8098/admin/explore/clusters/default/bucket_types)
+[[ ! -z "$BUCKET_TYPES" ]]
+
+[ "$(echo $BUCKET_TYPES | jq -r '.bucket_types[] | select(.id == "test") | .props.datatype')" == "counter" ]
+if [ '<% riak_flavor %>' == 'ts' ]; then
+  # Check that the TS tables have been created
+  [ "$(echo $BUCKET_TYPES | jq -r '.bucket_types[] | select(.id == "GeoCheckin") | .props.ddl.local_key[]' | tr -d '\n')" == "idtime" ]
+fi
+
+# Remove the container
+docker rm -f $SCHEMAS_CONTAINER || true
+----
+endif::riak_explorer[]
+
+ifdef::riak_client[]
+== Test Riak Client
+
+Test that the Python Riak Client can interact with the cluster.
+
+.Pytest Container
+[source,Dockerfile]
+[asciibuild,Dockerfile,image=riak-docker-tests,run=true,run_opts="--link {riak_pkg} --label role=pytests -i -v $(pwd)/test:/usr/src/test -v /var/run/docker.sock:/var/run/docker.sock"]
+----
+FROM alpine
+RUN apk add --no-cache py2-pip bash ca-certificates docker
+RUN pip install --upgrade pip pytest riak
+WORKDIR /usr/src/test
+CMD /bin/cat
+----
+
+Run the `py.test` tests found in the link:test/[test/] folder.
+
+.Run Tests
+[source,bash]
+[asciibuild,bash,container="Pytest Container"]
+----
+py.test -v
+----
+
+.Cleanup Test Container
+[source,bash]
+[asciibuild,bash]
+----
+# Don't fail the build if cleanup doesn't happen
+set +e
+
+# Remove Python resources
+for f in __pycache__ .cache *.pyc; do
+  rm -Rf $(find test -name $f -print) || true
+done
+docker rm -f $(docker ps -aqf label=role=pytests) || true
+----
+endif::riak_client[]
+
+== Cleanup
+
+Clean up temporary and transitory files that get rebuilt each time this build is run.
+
+This step can be skipped by setting the attribute `skip_clean` when running the build.
+
+ifndef::skip_clean[]
+.Cleanup
+[source,bash]
+[asciibuild,bash]
+----
+# Don't fail the build if cleanup doesn't happen
+set +e
+
+# Remove the Dockerfile we generate
+rm -Rf Dockerfile
+# Remove the cluster and other containers we started for tests
+for r in cluster schemas; do
+  docker rm -f $(docker ps -aqf label=role=$r) || true
+done
+----
+endif::[]
+
+== Publish
+
+Tag and publish the image if the attribute `publish` is set when running the build.
+
+* `publish`: {publish}
+
+ifdef::publish[]
+:docker_image_name: riak-{riak_flavor}:{os_family}-{riak_version}
+ifdef::docker_org[]
+:docker_image_tag: {docker_org}/{docker_image_name}
+endif::docker_org[]
+ifndef::docker_org[]
+:docker_image_tag: {docker_image_name}
+endif::docker_org[]
+
+.Tag Image
+[source,bash]
+[asciibuild,bash]
+----
+docker tag {{riak_tag}} {{docker_image_tag}}
+# Push specific version
+docker push {{docker_image_tag}}
+----
+
+ifdef::latest[]
+ifdef::docker_org[]
+:docker_latest_tag: {docker_org}/riak-{riak_flavor}:latest
+endif::docker_org[]
+ifndef::docker_org[]
+:docker_latest_tag: riak-{riak_flavor}:latest
+endif::docker_org[]
+
+.Tag Latest Image
+[source,bash]
+[asciibuild,bash]
+----
+# Push 'latest' tag
+docker tag {{riak_tag}} {{docker_latest_tag}}
+docker push {{docker_latest_tag}}
+----
+endif::latest[]
+endif::publish[]
